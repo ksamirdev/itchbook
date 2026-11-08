@@ -22,6 +22,8 @@ import (
 // maxRequest is the most messages one re-request may ask for.
 const maxRequest = 0xFFFE
 
+const maxRetryAfter = 100 * time.Millisecond
+
 // Stats counts what happened to packets and messages.
 type Stats struct {
 	Packets    uint64 // packets received on any line
@@ -36,18 +38,21 @@ type Stats struct {
 type Handler struct {
 	Books *book.Books
 	// RetryAfter is how long to wait for a re-request to be answered before
-	// asking again.
+	// asking again. Each retry for the same range waits twice as long, up to
+	// maxRetryAfter, so a slow answer is not buried under copies of itself.
 	RetryAfter time.Duration
 	Stats      Stats
 
-	session [10]byte
-	started bool
-	next    uint64 // sequence number of the next message to apply
-	seen    uint64 // one past the highest sequence number the exchange has sent
-	ended   bool
-	reqNext uint64 // next when the last re-request was sent
-	reqAt   time.Time
-	req     [mold.HeaderLen]byte
+	session  [10]byte
+	started  bool
+	next     uint64 // sequence number of the next message to apply
+	seen     uint64 // one past the highest sequence number the exchange has sent
+	ended    bool
+	reqEnd   uint64    // one past the last message the last re-request asked for
+	quietAt  time.Time // when the last re-request was sent or answered in part
+	wait     time.Duration
+	lastNext uint64
+	req      [mold.HeaderLen]byte
 }
 
 func New(books *book.Books) *Handler {
@@ -131,17 +136,23 @@ func (h *Handler) apply(body []byte, seq uint64) error {
 	return nil
 }
 
-// request returns a re-request for the missing messages, unless one for the
-// same gap is still in flight. The slice is reused by the next call.
+// request returns a re-request for the missing messages, unless the answer
+// to the last one may still be arriving. The slice is reused by the next call.
 func (h *Handler) request(now time.Time) []byte {
+	if h.next != h.lastNext { // progress: the answer is flowing, restart the clock
+		h.lastNext, h.quietAt, h.wait = h.next, now, h.RetryAfter
+	}
 	if h.next >= h.seen {
 		return nil
 	}
-	if h.next == h.reqNext && now.Sub(h.reqAt) < h.RetryAfter {
-		return nil
+	if h.next < h.reqEnd { // still waiting for messages already asked for
+		if now.Sub(h.quietAt) < h.wait {
+			return nil
+		}
+		h.wait = min(2*h.wait, maxRetryAfter) // nothing came: ask again, later each time
 	}
-	h.reqNext, h.reqAt = h.next, now
-	h.Stats.Requests++
 	n := min(h.seen-h.next, maxRequest)
+	h.quietAt, h.reqEnd = now, h.next+n
+	h.Stats.Requests++
 	return mold.AppendHeader(h.req[:0], mold.Header{Session: h.session, Seq: h.next, Count: uint16(n)})
 }

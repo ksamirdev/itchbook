@@ -164,3 +164,62 @@ func TestPacketDoesNotAllocate(t *testing.T) {
 		t.Fatalf("%v allocations per packet", allocs)
 	}
 }
+
+// TestOneRequestPerGap loses a long stretch of packets on both lines and
+// delivers each answer packet by packet. The handler must not ask again for
+// a range that is still arriving: one request for the gap, and one for the
+// packets it dropped while the gap was open.
+func TestOneRequestPerGap(t *testing.T) {
+	s := session(rand.New(rand.NewPCG(3, 3)), 5000)
+	h := New(book.New(1 << 12))
+	var p mold.Packer
+	var pkts [][]byte
+	for seq := uint64(1); seq <= s.Len(); {
+		seq = s.Pack(&p, seq, 10)
+		pkts = append(pkts, slices.Clone(p.Packet()))
+	}
+	now := time.Unix(0, 0)
+	var asks []mold.Header
+	deliver := func(pkt []byte) {
+		if req, _ := h.Packet(pkt, now); req != nil {
+			rh, _ := mold.ParseHeader(req)
+			asks = append(asks, rh)
+		}
+	}
+	for i, pkt := range pkts {
+		if i < 10 || i >= 400 { // 10..399 lost on both lines
+			deliver(pkt)
+		}
+	}
+	for answered := 0; answered < len(asks); answered++ {
+		rh := asks[answered]
+		for seq, end := rh.Seq, rh.Seq+uint64(rh.Count); seq < end; {
+			seq = s.Pack(&p, seq, end-seq)
+			deliver(p.Packet())
+		}
+	}
+	if len(asks) != 2 || asks[1].Seq != asks[0].Seq+uint64(asks[0].Count) || h.Next() != s.Len()+1 {
+		t.Fatalf("re-requests %+v, next %d of %d", asks, h.Next(), s.Len()+1)
+	}
+
+	// Lose the end of the session and its answer: retries back off.
+	h2 := New(book.New(1 << 12))
+	for _, pkt := range pkts[:5] {
+		_, _ = h2.Packet(pkt, now)
+	}
+	eos := s.EndOfSession()
+	var sentAt []time.Duration
+	for ms := range 100 {
+		at := time.Duration(ms) * time.Millisecond
+		if req, _ := h2.Packet(eos, now.Add(at)); req != nil {
+			sentAt = append(sentAt, at)
+		}
+	}
+	want := []time.Duration{0, 2, 6, 14, 30, 62} // RetryAfter doubling from 2ms
+	for i := range want {
+		want[i] *= time.Millisecond
+	}
+	if !slices.Equal(sentAt, want) {
+		t.Fatalf("re-requests at %v, want %v", sentAt, want)
+	}
+}
