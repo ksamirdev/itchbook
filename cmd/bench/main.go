@@ -31,6 +31,7 @@ func main() {
 	cpuprofile := flag.String("cpuprofile", "", "write a CPU profile of the timed sections here")
 	memprofile := flag.String("memprofile", "", "write a profile of every allocation here")
 	capacity := flag.Int("capacity", 4<<20, "resting orders to size the order table for")
+	timed := flag.Bool("time", true, "time every message; reading the clock costs about as much as a message, so turn it off to measure throughput")
 	check := flag.Bool("check", false, "after each message, count books crossed while trading (untimed)")
 	flag.Parse()
 
@@ -57,7 +58,7 @@ func main() {
 		runtime.MemProfileRate = 1
 	}
 
-	r := run{books: book.New(*capacity), check: *check, limit: *limit}
+	r := run{books: book.New(*capacity), check: *check, limit: *limit, timed: *timed}
 	buf := make([]byte, *chunk+1<<16)
 	var tail int // bytes of a partial message carried into the next chunk
 	var applied time.Duration
@@ -107,6 +108,7 @@ type run struct {
 	crossed uint64
 	allocs  uint64
 	check   bool
+	timed   bool
 	limit   int
 	n       int
 }
@@ -124,12 +126,17 @@ func (r *run) chunk(b []byte) int {
 		msg := b[off+2 : off+2+size]
 		off += 2 + size
 
-		t := time.Now()
+		var t time.Time
+		if r.timed {
+			t = time.Now()
+		}
 		m, err := itch.Decode(msg)
 		if err == nil {
 			err = r.books.Apply(&m)
 		}
-		r.lat.Record(uint64(time.Since(t)))
+		if r.timed {
+			r.lat.Record(uint64(time.Since(t)))
+		}
 
 		r.n++
 		r.types[msg[0]]++
@@ -154,8 +161,10 @@ func (r *run) chunk(b []byte) int {
 func (r *run) report(w io.Writer, wall, applied time.Duration, before, after *runtime.MemStats) {
 	fmt.Fprintf(w, "messages        %d in %v (%.1fM msg/s through the book, %v wall)\n",
 		r.n, applied.Round(time.Millisecond), float64(r.n)/applied.Seconds()/1e6, wall.Round(time.Millisecond))
-	fmt.Fprintf(w, "latency ns      p50 %d  p90 %d  p99 %d  p99.9 %d  p99.99 %d  max %d\n",
-		r.lat.Quantile(.5), r.lat.Quantile(.9), r.lat.Quantile(.99), r.lat.Quantile(.999), r.lat.Quantile(.9999), r.lat.Max())
+	if r.timed {
+		fmt.Fprintf(w, "latency ns      p50 %d  p90 %d  p99 %d  p99.9 %d  p99.99 %d  max %d\n",
+			r.lat.Quantile(.5), r.lat.Quantile(.9), r.lat.Quantile(.99), r.lat.Quantile(.999), r.lat.Quantile(.9999), r.lat.Max())
+	}
 	fmt.Fprintf(w, "clock           %s\n", clockResolution())
 	fmt.Fprintf(w, "gc              %d cycles, %v total pause, %d allocations while applying (%.6f per message)\n",
 		after.NumGC-before.NumGC, time.Duration(after.PauseTotalNs-before.PauseTotalNs),
