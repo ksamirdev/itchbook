@@ -40,10 +40,15 @@ func newOrders(capacity int) orders {
 	return t
 }
 
-// home is the slot a ref hashes to. Fibonacci hashing spreads the nearly
-// sequential refs Nasdaq assigns across the table.
+// home is the slot a ref hashes to. Nasdaq hands out refs to new orders
+// nearly in order, so keeping each run of 512 consecutive refs in
+// consecutive slots puts every add next to the previous add, in a cache line
+// that is already loaded. Fibonacci hashing the run number scatters the runs
+// so that long probe runs, which make deletes slow, cannot form. See ADR 0003.
 func (t *orders) home(ref uint64) int {
-	return int((ref * 0x9E3779B97F4A7C15) >> t.shift)
+	const run = 9 // log2 of the refs kept together
+	block := (ref >> run) * 0x9E3779B97F4A7C15 >> (t.shift + run)
+	return int((block<<run | ref&(1<<run-1)) & uint64(len(t.slots)-1))
 }
 
 // find returns the slot holding ref, or the empty slot where it would go.
