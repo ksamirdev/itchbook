@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test -race -count=1 ./...
+      - run: go test ./internal/book -run '^$' -fuzz FuzzBooksMatchModel -fuzztime 30s
+      # Built from source with the job's Go: the prebuilt release binary is
+      # compiled with an older Go and refuses to lint a Go 1.26 module.
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: v2.6.2
+          install-mode: goinstall
